@@ -5,7 +5,5 @@ services:
     build: .
     image: sch_board_crawler:latest
     container_name: sch_board_crawler
-    env_file:
-      - .env
     restart: unless-stopped
     network_mode: "host" # 로컬 DB 접근을 위해 host 네트워크 사용
