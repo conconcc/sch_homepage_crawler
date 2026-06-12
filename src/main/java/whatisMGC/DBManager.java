@@ -1,14 +1,25 @@
 package whatisMGC;
 
 
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.sql.*;
-import java.util.*;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Savepoint;
+import java.sql.Statement;
+import java.sql.Timestamp;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
+
 import com.google.gson.Gson;
 
 public class DBManager {
@@ -81,6 +92,18 @@ public class DBManager {
             addMissingIndex(conn, "crawl_posts", "uk_crawl_posts_external_source_url", "UNIQUE (external_source_url)");
             addMissingIndex(conn, "crawl_posts", "crawl_posts_notice_FK", "FOREIGN KEY (id) REFERENCES notice(id) ON DELETE CASCADE ON UPDATE CASCADE");
 
+            // --- 6. academic_schedule ---
+            executeCreateTable(conn, "academic_schedule", getAcademicScheduleDdl());
+            addMissingColumn(conn, "academic_schedule", "id", "BIGINT(20) NOT NULL AUTO_INCREMENT PRIMARY KEY");
+            addMissingColumn(conn, "academic_schedule", "year", "INT(11) NOT NULL");
+            addMissingColumn(conn, "academic_schedule", "month", "INT(11) NOT NULL");
+            addMissingColumn(conn, "academic_schedule", "event_date", "VARCHAR(100) NOT NULL");
+            addMissingColumn(conn, "academic_schedule", "event_name", "VARCHAR(500) NOT NULL");
+            addMissingColumn(conn, "academic_schedule", "event_type", "VARCHAR(50) DEFAULT 'SCHEDULE'");
+            addMissingColumn(conn, "academic_schedule", "created_at", "BIGINT(20) NOT NULL");
+            addMissingColumn(conn, "academic_schedule", "updated_at", "BIGINT(20) NOT NULL");
+            addMissingIndex(conn, "academic_schedule", "uk_academic_schedule_unique", "UNIQUE (year, month, event_date, event_name)");
+            addMissingIndex(conn, "academic_schedule", "idx_academic_schedule_year_month", "KEY (year, month)");
 
             System.out.println("테이블 스키마 검사 및 생성 작업이 성공적으로 완료되었습니다.");
         } catch (SQLException e) {
@@ -226,6 +249,22 @@ public class DBManager {
                 "    PRIMARY KEY (id), " +
                 "    UNIQUE KEY uk_crawl_posts_external_source_url (external_source_url), " +
                 "    CONSTRAINT crawl_posts_notice_FK FOREIGN KEY (id) REFERENCES notice (id) ON DELETE CASCADE ON UPDATE CASCADE" +
+                ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci";
+    }
+
+    private String getAcademicScheduleDdl() {
+        return "CREATE TABLE IF NOT EXISTS academic_schedule (" +
+                "    id BIGINT(20) NOT NULL AUTO_INCREMENT, " +
+                "    year INT(11) NOT NULL, " +
+                "    month INT(11) NOT NULL, " +
+                "    event_date VARCHAR(100) NOT NULL, " +
+                "    event_name VARCHAR(500) NOT NULL, " +
+                "    event_type VARCHAR(50) DEFAULT 'SCHEDULE', " +
+                "    created_at BIGINT(20) NOT NULL, " +
+                "    updated_at BIGINT(20) NOT NULL, " +
+                "    PRIMARY KEY (id), " +
+                "    UNIQUE KEY uk_academic_schedule_unique (year, month, event_date, event_name), " +
+                "    KEY idx_academic_schedule_year_month (year, month)" +
                 ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci";
     }
 
@@ -758,7 +797,253 @@ public class DBManager {
     }
 
     /**
-     * PreparedStatement의 IN 절을 위한 ? 플레이스홀더 문자열 생성 헬퍼
+     * 학사일정 정보 저장 (중복 제거)
+     */
+    public void saveAcademicSchedules(List<AcademicScheduleInfo> schedules) {
+        if (schedules == null || schedules.isEmpty()) {
+            System.out.println("저장할 학사일정이 없습니다.");
+            return;
+        }
+
+        String sql = "INSERT INTO academic_schedule (year, month, event_date, event_name, event_type, created_at, updated_at) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?) " +
+                "ON DUPLICATE KEY UPDATE updated_at = ?, event_type = ?";
+
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            conn.setAutoCommit(false);
+            int batchCount = 0;
+
+            for (AcademicScheduleInfo schedule : schedules) {
+                pstmt.setInt(1, schedule.getYear());
+                pstmt.setInt(2, schedule.getMonth());
+                pstmt.setString(3, schedule.getEventDate());
+                pstmt.setString(4, schedule.getEventName());
+                pstmt.setString(5, schedule.getEventType());
+                pstmt.setLong(6, schedule.getCreatedAt());
+                pstmt.setLong(7, schedule.getUpdatedAt());
+                pstmt.setLong(8, schedule.getUpdatedAt());
+                pstmt.setString(9, schedule.getEventType());
+                pstmt.addBatch();
+                batchCount++;
+            }
+
+            int[] results = pstmt.executeBatch();
+            conn.commit();
+            System.out.println("학사일정 " + batchCount + "건이 성공적으로 저장되었습니다.");
+        } catch (SQLException e) {
+            System.err.println("학사일정 저장 중 오류 발생: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * 특정 연도의 학사일정 조회
+     */
+    public List<AcademicScheduleInfo> getAcademicSchedulesByYear(int year) {
+        List<AcademicScheduleInfo> schedules = new ArrayList<>();
+        String sql = "SELECT id, year, month, event_date, event_name, event_type, created_at, updated_at " +
+                "FROM academic_schedule WHERE year = ? ORDER BY month ASC, event_date ASC";
+
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setInt(1, year);
+
+            try (ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) {
+                    AcademicScheduleInfo schedule = new AcademicScheduleInfo();
+                    schedule.setYear(rs.getInt("year"));
+                    schedule.setMonth(rs.getInt("month"));
+                    schedule.setEventDate(rs.getString("event_date"));
+                    schedule.setEventName(rs.getString("event_name"));
+                    schedule.setEventType(rs.getString("event_type"));
+                    schedule.setCreatedAt(rs.getLong("created_at"));
+                    schedule.setUpdatedAt(rs.getLong("updated_at"));
+                    schedules.add(schedule);
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("학사일정 조회 중 오류 발생: " + e.getMessage());
+            e.printStackTrace();
+        }
+
+        return schedules;
+    }
+
+    /**
+     * 학사일정 리스트를 기존의 `calendar` 테이블 형태로 변환하여 저장합니다.
+     * - eventDate 문자열에서 시작일/종료일을 파싱하여 `start_date`, `end_date`를 생성합니다.
+     * - 동일한 (start_date, end_date, title) 레코드가 존재하면 업데이트하고, 없으면 INSERT 합니다.
+     *
+     * @param schedules 학사일정 목록
+     */
+    public boolean saveSchedulesToCalendar(List<AcademicScheduleInfo> schedules) {
+        if (schedules == null || schedules.isEmpty()) {
+            System.out.println("저장할 학사일정이 없습니다 (calendar 테이블)");
+            return true;
+        }
+
+        String checkSql = "SELECT COUNT(*) FROM calendar WHERE start_date = ? AND end_date = ? AND title = ?";
+        String insertSql = "INSERT INTO calendar (start_date, end_date, title, type) VALUES (?, ?, ?, ?)";
+        String updateSql = "UPDATE calendar SET type = ?, title = ? WHERE start_date = ? AND end_date = ? AND title = ?";
+
+        try (Connection conn = getConnection()) {
+            conn.setAutoCommit(false);
+
+            try (PreparedStatement checkStmt = conn.prepareStatement(checkSql);
+                 PreparedStatement insertStmt = conn.prepareStatement(insertSql);
+                 PreparedStatement updateStmt = conn.prepareStatement(updateSql)) {
+
+                int processed = 0;
+
+                for (AcademicScheduleInfo s : schedules) {
+                    String[] dates = parseEventDateToYmd(s);
+                    String start = dates[0];
+                    String end = dates[1];
+                    String title = s.getEventName() == null ? "" : s.getEventName();
+                    String type = s.getEventType() == null ? "event" : s.getEventType();
+
+                    // 중복 검사
+                    checkStmt.setString(1, start);
+                    checkStmt.setString(2, end);
+                    checkStmt.setString(3, title);
+                    try (ResultSet rs = checkStmt.executeQuery()) {
+                        int exists = 0;
+                        if (rs.next()) exists = rs.getInt(1);
+
+                        if (exists > 0) {
+                            // 업데이트
+                            updateStmt.setString(1, type);
+                            updateStmt.setString(2, title);
+                            updateStmt.setString(3, start);
+                            updateStmt.setString(4, end);
+                            updateStmt.setString(5, title);
+                            updateStmt.executeUpdate();
+                        } else {
+                            // INSERT
+                            insertStmt.setString(1, start);
+                            insertStmt.setString(2, end);
+                            insertStmt.setString(3, title);
+                            insertStmt.setString(4, type);
+                            insertStmt.executeUpdate();
+                        }
+                    }
+                    processed++;
+                }
+
+                conn.commit();
+                System.out.println("calendar 테이블에 " + processed + "건 처리(INSERT/UPDATE) 완료");
+                return true;
+            } catch (SQLException e) {
+                conn.rollback();
+                throw e;
+            }
+        } catch (SQLException e) {
+            System.err.println("calendar 저장 중 오류: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    /**
+     * AcademicScheduleInfo.eventDate 문자열을 yyyy-MM-dd 형태의 시작/종료일로 변환합니다.
+     * 가능한 형식 예시:
+     *  - "01.01(목)" -> start = yyyy-01-01, end = start
+     *  - "01.05(월) ~ 01.09(금)" -> start = yyyy-01-05, end = yyyy-01-09
+     *  - "5일" 또는 "5" 같은 경우에는 AcademicScheduleInfo.month를 사용
+     *
+     * 반환값: [startYmd, endYmd]
+     */
+    private String[] parseEventDateToYmd(AcademicScheduleInfo s) {
+        String defaultDay = "01";
+        int year = s.getYear();
+        int monthFromField = s.getMonth();
+        String raw = s.getEventDate();
+        if (raw == null) raw = "";
+
+        // 정규식으로 날짜 추출 (MM[./-]DD 또는 D{1,2})
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile("(\\d{1,2})[\\./-](\\d{1,2})");
+        java.util.regex.Matcher m = p.matcher(raw);
+
+        String startMonth = null;
+        String startDay = null;
+        String endMonth = null;
+        String endDay = null;
+
+        if (m.find()) {
+            startMonth = m.group(1);
+            startDay = m.group(2);
+            // 두 번째 날짜가 있으면 찾기
+            if (m.find()) {
+                endMonth = m.group(1);
+                endDay = m.group(2);
+            }
+        } else {
+            // MM 없음, 숫자(일)만 있는 경우
+            java.util.regex.Pattern p2 = java.util.regex.Pattern.compile("(\\d{1,2})\\s*일");
+            java.util.regex.Matcher m2 = p2.matcher(raw);
+            if (m2.find()) {
+                startDay = m2.group(1);
+                startMonth = String.valueOf(monthFromField);
+            }
+        }
+
+        if (startDay == null) startDay = defaultDay;
+        if (startMonth == null) startMonth = String.valueOf(monthFromField <= 0 ? 1 : monthFromField);
+        if (endDay == null) endDay = startDay;
+        if (endMonth == null) endMonth = startMonth;
+
+        // 정리하여 yyyy-MM-dd
+        try {
+            int sm = Integer.parseInt(startMonth);
+            int sd = Integer.parseInt(startDay);
+            int em = Integer.parseInt(endMonth);
+            int ed = Integer.parseInt(endDay);
+            java.time.LocalDate startDate = java.time.LocalDate.of(year, sm, Math.max(1, sd));
+            java.time.LocalDate endDate = java.time.LocalDate.of(year, em, Math.max(1, ed));
+            return new String[]{startDate.toString(), endDate.toString()};
+        } catch (Exception ex) {
+            // 파싱 실패 시 연-월-01 로 대체
+            String ym = String.format("%04d-%02d-01", year, Math.max(1, monthFromField <= 0 ? 1 : monthFromField));
+            return new String[]{ym, ym};
+        }
+    }
+
+    /**
+     * 모든 학사일정 삭제
+     */
+    public void deleteAllAcademicSchedules() {
+        String sql = "DELETE FROM academic_schedule";
+
+        try (Connection conn = getConnection();
+             Statement stmt = conn.createStatement()) {
+            int deletedCount = stmt.executeUpdate(sql);
+            System.out.println("기존 학사일정 " + deletedCount + "건이 삭제되었습니다.");
+        } catch (SQLException e) {
+            System.err.println("학사일정 삭제 중 오류 발생: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * 특정 연도의 학사일정 삭제
+     */
+    public void deleteAcademicSchedulesByYear(int year) {
+        String sql = "DELETE FROM academic_schedule WHERE year = ?";
+
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setInt(1, year);
+            int deletedCount = pstmt.executeUpdate();
+            System.out.println("연도 " + year + "의 학사일정 " + deletedCount + "건이 삭제되었습니다.");
+        } catch (SQLException e) {
+            System.err.println("학사일정 삭제 중 오류 발생: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * PreparedStatement의 IN 절을 위한 ? 자리표 문자열 생성
      */
     private String createPlaceholders(int count) {
         if (count <= 0) {
